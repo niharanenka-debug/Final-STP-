@@ -1,0 +1,10 @@
+student_id,student_name,class_name,subject,exam,term,marks_obtained,max_marks,attendance_percent
+S001,Asha Kumar,10-A,Mathematics,Midterm,Term 1,82,100,94
+S001,Asha Kumar,10-A,Physics,Midterm,Term 1,48,100,88
+S001,Asha Kumar,10-A,English,Midterm,Term 1,76,100,94
+S002,Ravi Singh,10-A,Mathematics,Midterm,Term 1,67,100,82
+S002,Ravi Singh,10-A,Physics,Midterm,Term 1,74,100,82
+S002,Ravi Singh,10-A,English,Midterm,Term 1,59,100,82
+S003,Meera Shah,10-A,Mathematics,Midterm,Term 1,91,100,98
+S003,Meera Shah,10-A,Physics,Midterm,Term 1,86,100,98
+S003,Meera Shah,10-A,English,Midterm,Term 1,88,100,98
