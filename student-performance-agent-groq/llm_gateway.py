@@ -1,744 +1,879 @@
 from __future__ import annotations
-
 import json
 import os
-import threading
 import time
-from collections import deque
 from dataclasses import dataclass
-from typing import Any
-
+from typing import Any, Iterable
 import requests
 from dotenv import load_dotenv
-
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 load_dotenv()
-
-
-def config_value(name: str, default: str = "") -> str:
-    """Read local .env first, then Streamlit Cloud Secrets."""
+def config_value(
+    name: str,
+    default: str = "",
+) -> str:
+    """
+    Read configuration from:
+    1. Environment variables
+    2. Streamlit secrets
+    3. Default value
+    """
     value = os.getenv(name)
-
     if value:
-        return value
-
+        return str(value).strip()
     try:
         import streamlit as st
-        return str(st.secrets.get(name, default))
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value).strip()
     except Exception:
-        return default
-
-
-try:
-    import tiktoken
-except ImportError:
-    tiktoken = None
-
-
-# -------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------
-
-TPM_LIMIT = int(config_value("GROQ_TPM_LIMIT", "8000"))
-WINDOW_SECONDS = 60.0
-
-TARGET_INPUT_TOKENS = int(
-    config_value("GROQ_CHUNK_INPUT_TOKENS", "4000")
+        pass
+    return default
+# ============================================================
+# CONFIGURATION
+# ============================================================
+DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_URL = (
+    "https://api.groq.com/openai/v1/chat/completions"
 )
-
-MAX_REQUEST_TOKENS = int(
-    config_value("GROQ_MAX_REQUEST_TOKENS", "6000")
-)
-
-DEFAULT_OUTPUT_TOKENS = int(
-    config_value("GROQ_MAX_OUTPUT_TOKENS", "700")
-)
-
-MAX_RETRIES = int(
-    config_value("GROQ_MAX_RETRIES", "4")
-)
-
-
-# -------------------------------------------------------------------
-# Exceptions
-# -------------------------------------------------------------------
-
+DEFAULT_OUTPUT_TOKENS = 700
+MAX_REQUEST_TOKENS = 6000
+MAX_RETRIES = 3
+WINDOW_SECONDS = 60
+TPM_LIMIT = 8000
+# ============================================================
+# EXCEPTIONS
+# ============================================================
 class RequestTooLarge(RuntimeError):
-    """Raised when a request is too large."""
-
-
+    pass
 class RateLimitExceeded(RuntimeError):
-    """Raised when a request cannot be completed after retries."""
-
-
-# -------------------------------------------------------------------
-# Token helpers
-# -------------------------------------------------------------------
-
-def estimate_tokens(value: Any) -> int:
-    """Estimate token count."""
-
-    if not isinstance(value, str):
-        value = json.dumps(
-            value,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            default=str,
-        )
-
-    if tiktoken is not None:
-        try:
-            encoder = tiktoken.get_encoding("cl100k_base")
-            return max(1, len(encoder.encode(value)))
-        except Exception:
-            pass
-
-    # Fallback approximation
-    return max(1, (len(value) + 3) // 4)
-
-
-def compact_json(value: Any) -> str:
-    """Convert Python object to compact JSON."""
+    pass
+# ============================================================
+# TOKEN ESTIMATION
+# ============================================================
+def estimate_tokens(
+    text: str,
+) -> int:
+    """
+    Lightweight token estimator.
+    We intentionally avoid depending on tiktoken because
+    Groq model tokenizers may differ.
+    """
+    if not text:
+        return 0
+    # Rough approximation:
+    # 1 token ~= 4 characters for normal English text.
+    return max(
+        1,
+        (len(text) + 3) // 4,
+    )
+# ============================================================
+# JSON COMPRESSION
+# ============================================================
+def compact_json(
+    value: Any,
+) -> str:
     return json.dumps(
         value,
-        separators=(",", ":"),
         ensure_ascii=False,
+        separators=(",", ":"),
         default=str,
     )
-
-
-# -------------------------------------------------------------------
-# Usage tracking
-# -------------------------------------------------------------------
-
+# ============================================================
+# SIMPLE RATE LIMITER
+# ============================================================
 @dataclass
-class UsageEvent:
+class RequestRecord:
     timestamp: float
-    estimated_tokens: int
-    actual_tokens: int | None = None
-
-    @property
-    def reserved_tokens(self) -> int:
-        return max(
-            self.estimated_tokens,
-            self.actual_tokens or 0,
-        )
-
-
-class RollingTokenLimiter:
-    """Simple rolling-window token limiter."""
-
+    tokens: int
+class SimpleRateLimiter:
+    """
+    Simple sequential token limiter.
+    This intentionally avoids threading.Lock and the old
+    _prune() implementation that caused the previous error.
+    """
     def __init__(
         self,
         limit: int = TPM_LIMIT,
-        window_seconds: float = WINDOW_SECONDS,
+        window: int = WINDOW_SECONDS,
+    ):
+        self.limit = max(
+            1,
+            int(limit),
+        )
+        self.window = max(
+            1,
+            int(window),
+        )
+        self.events: list[
+            RequestRecord
+        ] = []
+    def cleanup(self) -> None:
+        now = time.time()
+        cutoff = (
+            now - self.window
+        )
+        self.events = [
+            event
+            for event in self.events
+            if event.timestamp >= cutoff
+        ]
+    def current_usage(self) -> int:
+        self.cleanup()
+        return sum(
+            event.tokens
+            for event in self.events
+        )
+    def wait_for_capacity(
+        self,
+        required_tokens: int,
     ) -> None:
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self.events: deque[UsageEvent] = deque()
-        self.lock = threading.Lock()
-
-    def _prune(self, now: float) -> None:
-        while (
-            self.events
-            and now - self.events[0].timestamp
-            >= self.window_seconds
-        ):
-            self.events.popleft()
-
-    def used(self) -> int:
-        with self.lock:
-            now = time.monotonic()
-            self._prune(now)
-
-            return sum(
-                event.reserved_tokens
-                for event in self.events
-            )
-
-    def wait_for_budget(self, tokens: int) -> None:
-        if tokens > self.limit:
+        required_tokens = max(
+            1,
+            int(required_tokens),
+        )
+        # If a single request is larger than the entire
+        # configured budget, it cannot fit.
+        if required_tokens > self.limit:
             raise RateLimitExceeded(
-                f"Request needs approximately {tokens} tokens, "
-                f"but configured TPM limit is {self.limit}."
+                "Requested token budget "
+                f"{required_tokens} exceeds "
+                f"configured TPM limit "
+                f"{self.limit}."
             )
-
         while True:
-            with self.lock:
-                now = time.monotonic()
-                self._prune(now)
-
-                used = sum(
-                    event.reserved_tokens
-                    for event in self.events
+            self.cleanup()
+            used = self.current_usage()
+            if (
+                used + required_tokens
+                <= self.limit
+            ):
+                return
+            if not self.events:
+                return
+            oldest = min(
+                self.events,
+                key=lambda item: item.timestamp,
+            )
+            wait_seconds = (
+                oldest.timestamp
+                + self.window
+                - time.time()
+            )
+            if wait_seconds <= 0:
+                self.cleanup()
+                continue
+            time.sleep(
+                min(
+                    wait_seconds,
+                    5.0,
                 )
-
-                if used + tokens <= self.limit:
-                    return
-
-                sleep_for = max(
-                    0.25,
-                    self.window_seconds
-                    - (now - self.events[0].timestamp)
-                    + 0.05,
-                )
-
-            time.sleep(sleep_for)
-
+            )
     def reserve(
         self,
-        estimated_tokens: int,
-    ) -> UsageEvent:
-
-        self.wait_for_budget(estimated_tokens)
-
-        event = UsageEvent(
-            timestamp=time.monotonic(),
-            estimated_tokens=estimated_tokens,
-        )
-
-        with self.lock:
-            self.events.append(event)
-
-        return event
-
-    def record_actual(
-        self,
-        event: UsageEvent,
-        actual_tokens: int | None,
+        tokens: int,
     ) -> None:
-
-        if actual_tokens is not None:
-            event.actual_tokens = actual_tokens
-
-
-# -------------------------------------------------------------------
-# Groq client
-# -------------------------------------------------------------------
-
+        self.cleanup()
+        self.events.append(
+            RequestRecord(
+                timestamp=time.time(),
+                tokens=max(
+                    1,
+                    int(tokens),
+                ),
+            )
+        )
+# ============================================================
+# GROQ CLIENT
+# ============================================================
 class GroqClient:
-
-    def __init__(self) -> None:
-
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        url: str | None = None,
+        max_output_tokens: int | None = None,
+        max_request_tokens: int | None = None,
+        max_retries: int | None = None,
+    ):
         self.api_key = (
-            config_value("GROQ_API_KEY")
-            or config_value("LLM_API_KEY")
+            api_key
+            or config_value(
+                "GROQ_API_KEY"
+            )
+            or config_value(
+                "LLM_API_KEY"
+            )
         )
-
-        self.model = config_value(
-            "GROQ_MODEL",
-            "openai/gpt-oss-20b",
+        self.model = (
+            model
+            or config_value(
+                "GROQ_MODEL",
+                DEFAULT_MODEL,
+            )
         )
-
-        self.url = config_value(
-            "GROQ_API_URL",
-            "https://api.groq.com/openai/v1/chat/completions",
+        self.url = (
+            url
+            or config_value(
+                "GROQ_API_URL",
+                DEFAULT_URL,
+            )
         )
-
         self.max_output_tokens = int(
-            config_value(
+            max_output_tokens
+            if max_output_tokens is not None
+            else config_value(
                 "GROQ_MAX_OUTPUT_TOKENS",
                 str(DEFAULT_OUTPUT_TOKENS),
             )
         )
-
         self.max_request_tokens = int(
-            config_value(
+            max_request_tokens
+            if max_request_tokens is not None
+            else config_value(
                 "GROQ_MAX_REQUEST_TOKENS",
                 str(MAX_REQUEST_TOKENS),
             )
         )
-
-        self.limiter = RollingTokenLimiter()
-
+        self.max_retries = int(
+            max_retries
+            if max_retries is not None
+            else config_value(
+                "GROQ_MAX_RETRIES",
+                str(MAX_RETRIES),
+            )
+        )
+        self.limiter = SimpleRateLimiter(
+            limit=int(
+                config_value(
+                    "GROQ_TPM_LIMIT",
+                    str(TPM_LIMIT),
+                )
+            ),
+            window=WINDOW_SECONDS,
+        )
         self.session = requests.Session()
-
-    # ---------------------------------------------------------------
-    # Main completion method
-    # ---------------------------------------------------------------
-
+    # ========================================================
+    # API KEY
+    # ========================================================
+    def _check_api_key(self) -> None:
+        if not self.api_key:
+            raise RuntimeError(
+                "Groq API key is missing.\n\n"
+                "Set GROQ_API_KEY in:\n"
+                "• Streamlit Cloud Secrets, or\n"
+                "• .env"
+            )
+    # ========================================================
+    # HEADERS
+    # ========================================================
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization":
+                f"Bearer {self.api_key}",
+            "Content-Type":
+                "application/json",
+        }
+    # ========================================================
+    # COMPLETE
+    # ========================================================
     def complete(
         self,
         system: str,
         user: str,
-        *,
         max_output_tokens: int | None = None,
     ) -> str:
-
-        # -----------------------------------------------------------
-        # API key check
-        # -----------------------------------------------------------
-
-        if not self.api_key:
-            raise RuntimeError(
-                "GROQ_API_KEY is missing. "
-                "Add GROQ_API_KEY to Streamlit Cloud Secrets "
-                "or your local .env file."
-            )
-
-        output_budget = min(
-            max_output_tokens or self.max_output_tokens,
-            self.max_output_tokens,
+        self._check_api_key()
+        output_tokens = int(
+            max_output_tokens
+            if max_output_tokens is not None
+            else self.max_output_tokens
         )
-
-        current_user = user
-        last_error: Exception | None = None
-
-        # -----------------------------------------------------------
-        # Retry loop
-        # -----------------------------------------------------------
-
-        for attempt in range(MAX_RETRIES + 1):
-
-            input_tokens = (
-                estimate_tokens(system)
-                + estimate_tokens(current_user)
+        output_tokens = max(
+            1,
+            output_tokens,
+        )
+        original_user = user
+        estimated_input = estimate_tokens(
+            system
+        ) + estimate_tokens(
+            user
+        )
+        # ----------------------------------------------------
+        # Shrink oversized requests
+        # ----------------------------------------------------
+        if (
+            estimated_input
+            + output_tokens
+            > self.max_request_tokens
+        ):
+            allowed_input = max(
+                500,
+                self.max_request_tokens
+                - output_tokens,
             )
-
-            reserved = input_tokens + output_budget
-
-            # -------------------------------------------------------
-            # Request too large
-            # -------------------------------------------------------
-
-            if reserved > self.max_request_tokens:
-
-                if attempt >= MAX_RETRIES:
-                    raise RequestTooLarge(
-                        f"Estimated request is {reserved} tokens, "
-                        f"but maximum configured request size is "
-                        f"{self.max_request_tokens}."
-                    )
-
-                current_user = self._shrink_text(
-                    current_user,
-                    0.55,
-                )
-
-                output_budget = max(
-                    250,
-                    int(output_budget * 0.75),
-                )
-
-                continue
-
-            # -------------------------------------------------------
-            # Reserve token budget
-            # -------------------------------------------------------
-
-            event = self.limiter.reserve(reserved)
-
+            user = self._shrink_text(
+                user,
+                allowed_input,
+            )
+            estimated_input = (
+                estimate_tokens(system)
+                + estimate_tokens(user)
+            )
+        if (
+            estimated_input
+            + output_tokens
+            > self.max_request_tokens
+        ):
+            # Reduce output budget as a second protection.
+            output_tokens = min(
+                output_tokens,
+                max(
+                    200,
+                    self.max_request_tokens
+                    - estimated_input,
+                ),
+            )
+        total_estimated = (
+            estimated_input
+            + output_tokens
+        )
+        if (
+            total_estimated
+            > self.max_request_tokens
+        ):
+            raise RequestTooLarge(
+                "Request is too large for the "
+                f"configured limit. "
+                f"Estimated tokens: "
+                f"{total_estimated}; "
+                f"maximum: "
+                f"{self.max_request_tokens}."
+            )
+        # ----------------------------------------------------
+        # Retry loop
+        # ----------------------------------------------------
+        last_error = None
+        for attempt in range(
+            self.max_retries + 1
+        ):
             try:
-
-                # ---------------------------------------------------
-                # Groq API request
-                # ---------------------------------------------------
-
+                self.limiter.wait_for_capacity(
+                    total_estimated
+                )
+                self.limiter.reserve(
+                    total_estimated
+                )
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": system,
+                        },
+                        {
+                            "role": "user",
+                            "content": user,
+                        },
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens":
+                        output_tokens,
+                }
                 response = self.session.post(
                     self.url,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "temperature": 0.1,
-                        "max_tokens": output_budget,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": system,
-                            },
-                            {
-                                "role": "user",
-                                "content": current_user,
-                            },
-                        ],
-                    },
-                    timeout=120,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=90,
                 )
-
-                # ---------------------------------------------------
+                # ====================================================
                 # SUCCESS
-                # ---------------------------------------------------
-
+                # ====================================================
                 if response.ok:
-
                     try:
                         data = response.json()
-                    except ValueError as exc:
+                    except ValueError:
                         raise RuntimeError(
-                            "Groq returned a non-JSON response:\n"
+                            "Groq returned a non-JSON "
+                            "response:\n"
                             + response.text[:1000]
-                        ) from exc
-
-                    usage = data.get("usage", {})
-
-                    actual_tokens = (
-                        (usage.get("prompt_tokens") or 0)
-                        + (usage.get("completion_tokens") or 0)
+                        )
+                    choices = data.get(
+                        "choices"
                     )
-
-                    self.limiter.record_actual(
-                        event,
-                        actual_tokens or None,
-                    )
-
-                    choices = data.get("choices", [])
-
                     if not choices:
                         raise RuntimeError(
                             "Groq returned no choices.\n"
                             f"Response: {data}"
                         )
-
                     message = choices[0].get(
                         "message",
                         {},
                     )
-
-                    content = message.get("content")
-
-                    if not content:
+                    content = message.get(
+                        "content"
+                    )
+                    if content is None:
                         raise RuntimeError(
-                            "Groq returned an empty response.\n"
+                            "Groq returned an empty "
+                            "message.\n"
                             f"Response: {data}"
                         )
-
-                    return content
-
-                # ---------------------------------------------------
-                # ERROR DETAILS
-                # ---------------------------------------------------
-
-                status = response.status_code
-                body = response.text[:1500]
-
-                last_error = RuntimeError(
-                    f"Groq API error {status}: {body}"
-                )
-
-                # ---------------------------------------------------
-                # Authentication
-                # ---------------------------------------------------
-
-                if status == 401:
+                    return str(
+                        content
+                    ).strip()
+                # ====================================================
+                # AUTHENTICATION
+                # ====================================================
+                if response.status_code in (
+                    401,
+                    403,
+                ):
                     raise RuntimeError(
-                        "Groq authentication failed (HTTP 401).\n\n"
-                        "Check your GROQ_API_KEY in Streamlit "
-                        "Cloud Secrets.\n\n"
-                        f"Provider response:\n{body}"
+                        "Groq authentication failed "
+                        f"(HTTP {response.status_code}).\n\n"
+                        "Check GROQ_API_KEY in "
+                        "Streamlit Secrets.\n\n"
+                        f"Groq response: "
+                        f"{response.text[:1000]}"
                     )
-
-                # ---------------------------------------------------
-                # Forbidden
-                # ---------------------------------------------------
-
-                if status == 403:
-                    raise RuntimeError(
-                        "Groq rejected the request (HTTP 403).\n\n"
-                        f"Provider response:\n{body}"
+                # ====================================================
+                # BAD REQUEST
+                # ====================================================
+                if response.status_code == 400:
+                    error_text = (
+                        response.text[:1500]
                     )
-
-                # ---------------------------------------------------
-                # Bad request
-                # ---------------------------------------------------
-
-                if status == 400:
+                    # Try shrinking once if Groq says
+                    # the request is invalid because of size.
+                    if (
+                        "token" in error_text.lower()
+                        or "context" in error_text.lower()
+                        or "length" in error_text.lower()
+                    ):
+                        user = self._shrink_text(
+                            user,
+                            max(
+                                500,
+                                int(
+                                    estimate_tokens(
+                                        original_user
+                                    )
+                                    * 0.65
+                                ),
+                            ),
+                        )
+                        output_tokens = max(
+                            200,
+                            int(
+                                output_tokens
+                                * 0.8
+                            ),
+                        )
+                        total_estimated = (
+                            estimate_tokens(system)
+                            + estimate_tokens(user)
+                            + output_tokens
+                        )
+                        if attempt < self.max_retries:
+                            time.sleep(
+                                1.0 + attempt
+                            )
+                            continue
                     raise RuntimeError(
-                        "Groq rejected the request (HTTP 400).\n\n"
-                        f"Model: {self.model}\n"
-                        f"Provider response:\n{body}"
+                        "Groq rejected the request "
+                        "(HTTP 400).\n\n"
+                        f"Response: {error_text}"
                     )
-
-                # ---------------------------------------------------
-                # Model not found
-                # ---------------------------------------------------
-
-                if status == 404:
+                # ====================================================
+                # NOT FOUND
+                # ====================================================
+                if response.status_code == 404:
                     raise RuntimeError(
-                        "Groq endpoint or model was not found "
-                        "(HTTP 404).\n\n"
+                        "Groq endpoint or model was "
+                        "not found (HTTP 404).\n\n"
                         f"Model: {self.model}\n"
                         f"URL: {self.url}\n\n"
-                        f"Provider response:\n{body}"
+                        f"Groq response: "
+                        f"{response.text[:1000]}"
                     )
-
-                # ---------------------------------------------------
-                # Validation error
-                # ---------------------------------------------------
-
-                if status == 422:
-                    raise RuntimeError(
-                        "Groq rejected the request parameters "
-                        "(HTTP 422).\n\n"
-                        f"Provider response:\n{body}"
+                # ====================================================
+                # REQUEST TOO LARGE
+                # ====================================================
+                if response.status_code == 413:
+                    user = self._shrink_text(
+                        user,
+                        max(
+                            500,
+                            int(
+                                estimate_tokens(
+                                    user
+                                )
+                                * 0.60
+                            ),
+                        ),
                     )
-
-                # ---------------------------------------------------
-                # Request too large
-                # ---------------------------------------------------
-
-                if status == 413:
-
-                    if attempt >= MAX_RETRIES:
-                        raise RequestTooLarge(
-                            f"Groq rejected the request as too large.\n"
-                            f"Response: {body}"
+                    output_tokens = max(
+                        200,
+                        int(
+                            output_tokens
+                            * 0.75
+                        ),
+                    )
+                    total_estimated = (
+                        estimate_tokens(system)
+                        + estimate_tokens(user)
+                        + output_tokens
+                    )
+                    if attempt < self.max_retries:
+                        time.sleep(
+                            1.0 + attempt
                         )
-
-                    current_user = self._shrink_text(
-                        current_user,
-                        0.55,
+                        continue
+                    raise RequestTooLarge(
+                        "Groq rejected the request "
+                        "because it was too large "
+                        "(HTTP 413)."
                     )
-
-                    output_budget = max(
-                        250,
-                        int(output_budget * 0.75),
-                    )
-
-                    continue
-
-                # ---------------------------------------------------
-                # Rate limit
-                # ---------------------------------------------------
-
-                if status == 429:
-
-                    if attempt >= MAX_RETRIES:
-                        raise RateLimitExceeded(
-                            "Groq rate limit exceeded.\n\n"
-                            f"Provider response:\n{body}"
+                # ====================================================
+                # RATE LIMIT
+                # ====================================================
+                if response.status_code == 429:
+                    retry_after = (
+                        response.headers.get(
+                            "retry-after"
                         )
-
-                    retry_after = response.headers.get(
-                        "retry-after",
-                        "0",
                     )
-
-                    try:
-                        retry_delay = float(
-                            retry_after
+                    if retry_after:
+                        try:
+                            wait_seconds = float(
+                                retry_after
+                            )
+                        except ValueError:
+                            wait_seconds = (
+                                2.0
+                                * (
+                                    attempt + 1
+                                )
+                            )
+                    else:
+                        wait_seconds = (
+                            2.0
+                            * (
+                                attempt + 1
+                            )
                         )
-                    except (
-                        TypeError,
-                        ValueError,
-                    ):
-                        retry_delay = 0.0
-
-                    wait_time = max(
-                        retry_delay,
-                        1.0,
-                        self._wait_until_next_window(),
-                    )
-
-                    time.sleep(wait_time)
-
-                    current_user = self._shrink_text(
-                        current_user,
-                        0.75,
-                    )
-
-                    output_budget = max(
-                        250,
-                        int(output_budget * 0.85),
-                    )
-
-                    continue
-
-                # ---------------------------------------------------
-                # Server errors
-                # ---------------------------------------------------
-
-                if status >= 500:
-
-                    if attempt >= MAX_RETRIES:
-                        raise RuntimeError(
-                            "Groq server error after retries.\n\n"
-                            f"HTTP {status}\n"
-                            f"Provider response:\n{body}"
+                    if attempt < self.max_retries:
+                        time.sleep(
+                            min(
+                                wait_seconds,
+                                30.0,
+                            )
                         )
-
-                    time.sleep(
-                        min(2 ** attempt, 8)
+                        continue
+                    raise RateLimitExceeded(
+                        "Groq rate limit exceeded "
+                        "(HTTP 429).\n\n"
+                        f"Groq response: "
+                        f"{response.text[:1000]}"
                     )
-
-                    continue
-
-                # ---------------------------------------------------
-                # Unknown HTTP error
-                # ---------------------------------------------------
-
+                # ====================================================
+                # SERVER ERRORS
+                # ====================================================
+                if response.status_code >= 500:
+                    last_error = RuntimeError(
+                        "Groq server error "
+                        f"(HTTP {response.status_code}).\n"
+                        f"Response: "
+                        f"{response.text[:1000]}"
+                    )
+                    if attempt < self.max_retries:
+                        time.sleep(
+                            min(
+                                2 ** attempt,
+                                10,
+                            )
+                        )
+                        continue
+                    raise last_error
+                # ====================================================
+                # OTHER HTTP ERRORS
+                # ====================================================
                 raise RuntimeError(
-                    f"Groq API error {status}:\n{body}"
+                    "Groq API error "
+                    f"(HTTP {response.status_code}).\n\n"
+                    f"Response: "
+                    f"{response.text[:1000]}"
                 )
-
+            except requests.Timeout as exc:
+                last_error = RuntimeError(
+                    "Groq request timed out."
+                )
+                if attempt < self.max_retries:
+                    time.sleep(
+                        1.5
+                        * (
+                            attempt + 1
+                        )
+                    )
+                    continue
+                raise last_error from exc
+            except requests.ConnectionError as exc:
+                last_error = RuntimeError(
+                    "Could not connect to Groq."
+                )
+                if attempt < self.max_retries:
+                    time.sleep(
+                        1.5
+                        * (
+                            attempt + 1
+                        )
+                    )
+                    continue
+                raise last_error from exc
             except requests.RequestException as exc:
-
-                last_error = exc
-
-                if attempt >= MAX_RETRIES:
-                    break
-
-                time.sleep(
-                    min(2 ** attempt, 8)
+                last_error = RuntimeError(
+                    "Network error while calling Groq: "
+                    f"{exc}"
                 )
-
-        # -----------------------------------------------------------
-        # Final failure
-        # -----------------------------------------------------------
-
+                if attempt < self.max_retries:
+                    time.sleep(
+                        1.5
+                        * (
+                            attempt + 1
+                        )
+                    )
+                    continue
+                raise last_error from exc
+        if last_error:
+            raise last_error
         raise RuntimeError(
-            "Groq request failed after retries.\n\n"
-            f"Last error: {last_error}"
-        ) from last_error
-
-    # ---------------------------------------------------------------
-    # JSON completion
-    # ---------------------------------------------------------------
-
+            "Groq request failed for an unknown reason."
+        )
+    # ========================================================
+    # JSON COMPLETE
+    # ========================================================
     def json_complete(
         self,
         system: str,
         user: str,
-        *,
-        max_output_tokens: int = 500,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
-
-        text = self.complete(
+        json_instruction = """
+Return valid JSON only.
+Do not use Markdown.
+Do not use ```json fences.
+Do not add explanations before or after the JSON.
+The response must be a single valid JSON object.
+"""
+        combined_system = (
             system
-            + " Return valid compact JSON only. "
-              "No markdown fences. Keep arrays short.",
-            user,
-            max_output_tokens=max_output_tokens,
-        )
-
-        text = text.strip()
-
-        # Remove markdown fences if model adds them.
-        if text.startswith("```json"):
-            text = text[7:]
-
-        elif text.startswith("```"):
-            text = text[3:]
-
-        if text.endswith("```"):
-            text = text[:-3]
-
-        text = text.strip()
-
-        try:
-            result = json.loads(text)
-
-        except json.JSONDecodeError as exc:
-
-            raise RuntimeError(
-                "Groq returned invalid JSON.\n\n"
-                f"Raw response:\n{text[:1500]}"
-            ) from exc
-
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "Groq returned valid JSON, but it was not "
-                "a JSON object.\n\n"
-                f"Response:\n{text[:1500]}"
-            )
-
-        return result
-
-    # ---------------------------------------------------------------
-    # Token window
-    # ---------------------------------------------------------------
-
-    def _wait_until_next_window(self) -> float:
-
-        with self.limiter.lock:
-
-            if not self.limiter.events:
-                return 0.0
-
-            remaining = (
-                WINDOW_SECONDS
-                - (
-                    time.monotonic()
-                    - self.limiter.events[0].timestamp
-                )
-            )
-
-            return max(
-                0.0,
-                remaining + 0.05,
-            )
-
-    # ---------------------------------------------------------------
-    # Shrink oversized input
-    # ---------------------------------------------------------------
-
-    @staticmethod
-    def _shrink_text(
-        text: str,
-        ratio: float,
-    ) -> str:
-
-        target_chars = max(
-            1000,
-            int(len(text) * ratio),
-        )
-
-        return (
-            text[:target_chars]
             + "\n"
-            "[Input compacted after provider limit; "
-            "use only the retained records.]"
+            + json_instruction
         )
-
-
-# -------------------------------------------------------------------
-# Record chunking
-# -------------------------------------------------------------------
-
-def chunk_records(
-    records: list[dict[str, Any]],
-    system_prompt: str,
-    *,
-    target_tokens: int = TARGET_INPUT_TOKENS,
-) -> list[list[dict[str, Any]]]:
-
-    """Pack records into token-limited chunks."""
-
-    chunks: list[list[dict[str, Any]]] = []
-
-    current: list[dict[str, Any]] = []
-
-    base_tokens = estimate_tokens(
-        system_prompt
-    )
-
-    used = base_tokens
-
-    for record in records:
-
-        record_tokens = (
-            estimate_tokens(
-                compact_json(record)
+        text = self.complete(
+            combined_system,
+            user,
+            max_output_tokens=(
+                max_output_tokens
+                or 700
+            ),
+        )
+        cleaned = text.strip()
+        # ----------------------------------------------------
+        # Remove accidental Markdown fences
+        # ----------------------------------------------------
+        if cleaned.startswith(
+            "```json"
+        ):
+            cleaned = cleaned[
+                len("```json"):
+            ].strip()
+        elif cleaned.startswith(
+            "```"
+        ):
+            cleaned = cleaned[
+                len("```"):
+            ].strip()
+        if cleaned.endswith(
+            "```"
+        ):
+            cleaned = cleaned[
+                :-3
+            ].strip()
+        # ----------------------------------------------------
+        # Parse JSON
+        # ----------------------------------------------------
+        try:
+            result = json.loads(
+                cleaned
             )
-            + 2
+        except json.JSONDecodeError as exc:
+            # Try extracting the outermost JSON object.
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if (
+                start >= 0
+                and end > start
+            ):
+                candidate = cleaned[
+                    start:end + 1
+                ]
+                try:
+                    result = json.loads(
+                        candidate
+                    )
+                except json.JSONDecodeError:
+                    raise RuntimeError(
+                        "Groq returned invalid JSON.\n\n"
+                        f"Raw response:\n{cleaned[:3000]}"
+                    ) from exc
+            else:
+                raise RuntimeError(
+                    "Groq returned invalid JSON.\n\n"
+                    f"Raw response:\n{cleaned[:3000]}"
+                ) from exc
+        if not isinstance(
+            result,
+            dict,
+        ):
+            raise RuntimeError(
+                "Groq JSON response was not "
+                "a JSON object."
+            )
+        return result
+    # ========================================================
+    # SHRINK TEXT
+    # ========================================================
+    def _shrink_text(
+        self,
+        text: str,
+        target_tokens: int,
+    ) -> str:
+        if not text:
+            return text
+        target_tokens = max(
+            100,
+            int(target_tokens),
         )
-
+        target_chars = (
+            target_tokens * 4
+        )
+        if len(text) <= target_chars:
+            return text
+        # Keep both beginning and end.
+        # This is safer for JSON-like prompts because
+        # useful information may exist at either side.
+        head_chars = int(
+            target_chars * 0.75
+        )
+        tail_chars = (
+            target_chars
+            - head_chars
+        )
+        return (
+            text[:head_chars]
+            + "\n...[content shortened]...\n"
+            + text[-tail_chars:]
+        )
+# ============================================================
+# DEFAULT CLIENT
+# ============================================================
+client = GroqClient()
+# ============================================================
+# MODULE-LEVEL HELPERS
+# ============================================================
+def complete(
+    system: str,
+    user: str,
+    max_output_tokens: int = DEFAULT_OUTPUT_TOKENS,
+) -> str:
+    return client.complete(
+        system,
+        user,
+        max_output_tokens=max_output_tokens,
+    )
+def json_complete(
+    system: str,
+    user: str,
+    max_output_tokens: int = DEFAULT_OUTPUT_TOKENS,
+) -> dict[str, Any]:
+    return client.json_complete(
+        system,
+        user,
+        max_output_tokens=max_output_tokens,
+    )
+# ============================================================
+# CHUNK RECORDS
+# ============================================================
+def chunk_records(
+    records: Iterable[Any],
+    max_tokens: int = 3000,
+) -> list[list[Any]]:
+    """
+    Split records into token-safe batches.
+    """
+    batches: list[list[Any]] = []
+    current: list[Any] = []
+    current_tokens = 0
+    for record in records:
+        record_text = compact_json(
+            record
+        )
+        record_tokens = estimate_tokens(
+            record_text
+        )
         if (
             current
-            and used + record_tokens > target_tokens
+            and current_tokens
+            + record_tokens
+            > max_tokens
         ):
-            chunks.append(current)
-
+            batches.append(
+                current
+            )
             current = []
-
-            used = base_tokens
-
-        current.append(record)
-
-        used += record_tokens
-
+            current_tokens = 0
+        current.append(
+            record
+        )
+        current_tokens += (
+            record_tokens
+        )
     if current:
-        chunks.append(current)
+        batches.append(
+            current
+        )
+    return batches
 
-    return chunks
+Then make sure your files are exactly
+
+student-performance-agent-groq/
+│
+├── app.py
+├── agents.py
+├── llm_gateway.py
+├── requirements.txt
+│
+├── data/
+│   ├── __init__.py
+│   ├── calculations.py
+│   └── validation.py
+│
+└── storage/
+    ├── __init__.py
+    └── database.py
+
+And your requirements.txt should at least contain:
+
+streamlit
+pandas
+requests
+python-dotenv
+openpyxl
+
+Do not add tiktoken just for this fix. The new gateway deliberately uses a lightweight token estimate.
+
+After replacing the two files, restart/redeploy the Streamlit app. If it fails again, the new gateway should show the actual Groq HTTP status and response instead of the old redacted _prune() traceback.
